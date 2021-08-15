@@ -1,6 +1,7 @@
 #-*-coding:utf-8-*-
 import collections
 import copy
+import enum
 import re
 import sys
 
@@ -26,6 +27,8 @@ class NetworkGraph(nn.Module):
                 layer = quantize.QuantizeLayer(hardware_config, layer_config, quantize_config)
             elif layer_config['type'] in quantize.StraightLayerStr:
                 layer = quantize.StraightLayer(hardware_config, layer_config, quantize_config)
+            elif layer_config['type'] in quantize.GroupLayerStr:
+                layer = quantize.GroupLayer(hardware_config, layer_config, quantize_config)
             else:
                 assert 0, f'not support {layer_config["type"]}'
             self.layer_list.append(layer)
@@ -84,6 +87,9 @@ class NetworkGraph(nn.Module):
             if isinstance(layer, quantize.QuantizeLayer):
                 tensor_list.append(layer.set_weights_forward(tensor_list[input_index[0] + i + 1], net_bit_weights[count], adc_action))
                 # tensor_list.append(layer.forward(tensor_list[input_index[0] + i + 1], 'SINGLE_FIX_TEST', adc_action))
+                count = count + 1
+            elif isinstance(layer, quantize.GroupLayer):
+                tensor_list.append(layer.set_weights_forward(tensor_list[input_index[0] + i + 1], net_bit_weights[count], adc_action))
                 count = count + 1
             else:
                 if len(input_index) == 1:
@@ -156,17 +162,31 @@ class NetworkGraph(nn.Module):
                 # concat weights
                 total_weights = torch.cat([state_dict[key] for key in key_list], dim = 1)
                 # split weights
-                if layer_config['type'] == 'conv':
+                if 'groups' in layer_config.keys(): #group_conv keys: layer_list.i.layer_list.j.layer_list.k.weight, now we have layer_list.i
+                    weights_groups = torch.split(total_weights, int(layer_config['out_channels'] / layer_config['groups']), dim = 0)
                     split_len = (hardware_config['xbar_size'] // (layer_config['kernel_size'] ** 2))
-                elif layer_config['type'] == 'fc':
-                    split_len = hardware_config['xbar_size']
+                    for i, group_weight in enumerate(weights_groups):
+                        tmp_state_dict[tmp_key + f'.layer_list.1.{i}.last_value'] = state_dict[tmp_key + '.last_value'] 
+                        tmp_state_dict[tmp_key + f'.layer_list.1.{i}.bit_scale_list'] = state_dict[tmp_key + '.bit_scale_list']              
+                        weights_list = torch.split(group_weight, split_len, dim = 1)
+                        for j, weights in enumerate(weights_list):
+                            tmp_state_dict[tmp_key + f'.layer_list.1.{i}.layer_list.{j}.weight'] = weights
                 else:
-                    assert 0, f'not support {layer_config["type"]}'
-                weights_list = torch.split(total_weights, split_len, dim = 1)
-                # load weights
-                for i, weights in enumerate(weights_list):
-                    tmp_state_dict[tmp_key + f'.layer_list.{i}.weight'] = weights
+                    if layer_config['type'] == 'conv':
+                        split_len = (hardware_config['xbar_size'] // (layer_config['kernel_size'] ** 2))
+                    elif layer_config['type'] == 'fc':
+                        split_len = hardware_config['xbar_size']    
+                    else:
+                        assert 0, f'not support {layer_config["type"]}' 
+                    weights_list = torch.split(total_weights, split_len, dim = 1)
+                    # load weights
+                    for i, weights in enumerate(weights_list):
+                        tmp_state_dict[tmp_key + f'.layer_list.{i}.weight'] = weights
         # load weights
+        for i, layer in enumerate(self.layer_list):
+            if 'groups' in self.layer_list[i].layer_config.keys():
+                tmp_state_dict.pop(f"layer_list.{i}.last_value")
+                tmp_state_dict.pop(f"layer_list.{i}.bit_scale_list")         
         self.load_state_dict(tmp_state_dict)
 
 def get_net(hardware_config = None, cate = 'lenet', num_classes = 10):

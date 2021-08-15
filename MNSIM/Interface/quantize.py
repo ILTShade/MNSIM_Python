@@ -3,6 +3,7 @@ import collections
 import copy
 import math
 
+from numpy import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -98,11 +99,18 @@ class QuantizeLayer(nn.Module):
                 self.layer_config['stride'] = 1
             if 'padding' not in self.layer_config.keys():
                 self.layer_config['padding'] = 0
-            self.layer_list = nn.ModuleList([nn.Conv2d(
-                i, self.layer_config['out_channels'], self.layer_config['kernel_size'],
-                stride = self.layer_config['stride'], padding = self.layer_config['padding'], dilation = 1, groups = 1, bias = False
-                )
-                for i in in_channels_list])
+            if self.layer_config['kernel_size'] % 2 == 1:
+                self.layer_list = nn.ModuleList([nn.Conv2d(
+                    i, self.layer_config['out_channels'], self.layer_config['kernel_size'],
+                    stride = self.layer_config['stride'], padding = self.layer_config['padding'], dilation = 1, groups = 1, bias = False
+                    )
+                    for i in in_channels_list])
+            else:
+                self.layer_list = nn.ModuleList([EvenKernelConv(
+                    i, self.layer_config['out_channels'], self.layer_config['kernel_size'],
+                    stride = self.layer_config['stride'], padding = self.layer_config['padding'], dilation = 1, groups = 1, bias = False
+                    )
+                    for i in in_channels_list])
             self.split_input = channel_N
         elif self.layer_config['type'] == 'fc':
             assert 'in_features' in self.layer_config.keys()
@@ -375,7 +383,14 @@ class ExpandLayer(nn.Module):
         input_channels = inputs.size(1)
         pcd = (0, 0, 0, 0, 0, self._max_channels - input_channels)
         return nn.functional.pad(inputs, pcd, "constant", 0)
-
+class ConcatLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        output_list = copy.deepcopy(x[0])
+        for output in x[1:]:
+            output_list = torch.cat((output_list,output), dim=1)
+        return output_list
 class StraightLayer(nn.Module):
     def __init__(self, hardware_config, layer_config, quantize_config):
         super(StraightLayer, self).__init__()
@@ -420,9 +435,11 @@ class StraightLayer(nn.Module):
         elif self.layer_config['type'] == 'hard_tanh':
             self.layer = nn.Hardtanh()
         elif self.layer_config['type'] == "expand":
-            self.layer = ExpandLayer(layer_config["max_channels"])
+            self.layer = ExpandLayer(layer_config["_max_channels"])
         elif self.layer_config['type'] == 'downsample':
             self.layer = DownSampleLayer()
+        elif self.layer_config['type'] == 'concat':
+            self.layer = ConcatLayer()
         else:
             assert 0, f'not support {self.layer_config["type"]}'
         # self.last_value = nn.Parameter(torch.ones(1))
@@ -472,6 +489,8 @@ class StraightLayer(nn.Module):
                 self.layer_info['type'] = 'expand'
             elif self.layer_config["type"] == "downsample":
                 self.layer_info["type"] = 'downsample'
+            elif self.layer_config['type'] == 'concat':
+                self.layer_info['type'] == 'concat'
             else:
                 assert 0, f'not support {self.layer_config["type"]}'
         else:
@@ -511,5 +530,114 @@ class StraightLayer(nn.Module):
 StraightLayerStr = [
     'pooling', 'relu', 'view', 'bn', 'dropout',
     'element_sum', 'expand', 'AdaptiveAvgPool2d', 'downsample', 'flatten',
-    'hard_tanh'
+    'hard_tanh', 'concat'
 ]
+class SplitInputLayer(nn.Module):
+    def __init__(self, groups, in_channels):
+        super().__init__()
+        assert in_channels % groups == 0 
+        self.split_input = int(in_channels / groups)
+    def forward(self,x):
+        input_list = torch.split(x, self.split_input, dim = 1)
+        return input_list
+class GroupLayer(nn.Module):
+    def __init__(self, hardware_config, layer_config, quantize_config):
+        super().__init__()
+        self.hardware_config = copy.deepcopy(hardware_config)
+        self.layer_config = copy.deepcopy(layer_config)
+        self.quantize_config = copy.deepcopy(quantize_config)
+        assert 'groups' in layer_config.keys()
+        self.groups = self.layer_config['groups']
+        assert 'in_channels' in self.layer_config.keys() and self.layer_config['in_channels'] % self.layer_config['groups'] == 0
+        assert 'out_channels' in self.layer_config.keys() and self.layer_config['out_channels'] % self.layer_config['groups'] == 0
+        self.layer_list = nn.ModuleList([SplitInputLayer(self.groups, self.layer_config['in_channels'])])
+        conv_list = nn.ModuleList([])
+        for group_layer_config in self.split_layer_config():
+            conv_list.append(QuantizeLayer(self.hardware_config, group_layer_config, self.quantize_config))
+        self.layer_list.append(conv_list)
+        self.layer_list.append(ConcatLayer())
+    def split_layer_config(self):
+        self.group_in_channels = int(self.layer_config['in_channels'] / self.groups)
+        self.group_out_channels = int(self.layer_config['out_channels'] / self.groups)
+        group_layer_config_list = []
+        for i in range(self.groups):
+            group_layer_config_list.append(copy.deepcopy(self.layer_config))
+            group_layer_config_list[-1]['in_channels'] = self.group_in_channels
+            group_layer_config_list[-1]['out_channels'] = self.group_out_channels
+            group_layer_config_list[-1]['type'] = 'conv'
+        return group_layer_config_list
+    def structure_forward(self,input):
+        # generate input shape and output shape
+        self.input_shape = input.shape
+        output = self.forward(input, method = 'TRADITION')
+        self.output_shape = output.shape
+        # generate layer_info
+        self.layer_info = collections.OrderedDict()
+        if self.layer_config['type'] == 'group_conv':
+            self.layer_info['type'] = 'conv'
+            self.layer_info['Inputchannel'] = int(self.input_shape[1] / self.groups)
+            self.layer_info['Inputsize'] = list(self.input_shape[2:])
+            self.layer_info['Kernelsize'] = self.layer_config['kernel_size']
+            self.layer_info['Stride'] = self.layer_config['stride']
+            self.layer_info['Padding'] = self.layer_config['padding']
+            self.layer_info['Outputchannel'] = int(self.output_shape[1])
+            self.layer_info['Outputsize'] = list(self.output_shape[2:])
+            self.layer_info['groups'] = self.groups
+        else:
+            assert 0,'unsupported type:{} in GroupLayer'.format(self.layer_config['type'])
+        self.layer_info['Inputbit'] = int(self.layer_list[1][0].bit_scale_list[0,0].item())
+        self.layer_info['Weightbit'] = int(self.layer_list[1][0].quantize_config['weight_bit'])
+        self.layer_info['outputbit'] = int(self.layer_list[1][0].quantize_config['activation_bit'])
+        self.layer_info['row_split_num'] = len(self.layer_list[1][0].layer_list)
+        self.layer_info['weight_cycle'] = math.ceil((self.layer_list[1][0].quantize_config['weight_bit'] - 1) / (self.layer_list[1][0].hardware_config['weight_bit']))
+        if 'input_index' in self.layer_config:
+            self.layer_info['Inputindex'] = self.layer_config['input_index']
+        else:
+            self.layer_info['Inputindex'] = [-1]
+        self.layer_info['Outputindex'] = [1]
+        return output
+    def get_bit_weights(self):
+        bit_weights = []
+        for model in self.layer_list[1]:
+            bit_weights.append(model.get_bit_weights())
+        return bit_weights
+    def set_weights_forward(self, input, bit_weights, adc_action):
+        input_list = self.layer_list[0](input)
+        assert len(input_list) == len(bit_weights)
+        output_list = []
+        for i,model in enumerate(self.layer_list[1]):
+            output_list.append(model.set_weights_forward(input = input_list[i], bit_weights = bit_weights[i], adc_action = adc_action))
+        output = self.layer_list[2](output_list)
+        return output
+    def extra_repr(self):
+        return str(self.hardware_config) + ' ' + str(self.layer_config) + ' ' + str(self.quantize_config)
+    def forward(self, input, method = 'SINGLE_FIX_TEST', adc_action = 'SCALE'):
+        METHOD = method
+        # float method
+        assert METHOD != 'FIX_TRAIN'
+        input_list = self.layer_list[0](input)
+        output_list = []
+        for i,model in enumerate(self.layer_list[1]):
+            output_list.append(model(input_list[i], method = method, adc_action = adc_action))
+        output = self.layer_list[2](output_list)
+        return output
+    
+GroupLayerStr = ['group_conv']
+
+class EvenKernelConv(nn.Conv2d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.padding_flag = bool(random.randint(0, 1))
+    def forward(self, inputs):
+        outputs = super().forward(inputs)
+        # check for even kernel
+        if self.kernel_size[0] % 2 == 0 and \
+            self.padding[0] >= self.kernel_size[0] // 2:
+            # fake output
+            assert len(outputs.shape) == 4, \
+                "The outputs should have 4 dim"
+            if self.padding_flag:
+                outputs = outputs[:, :, :-1, :-1]
+            else:
+                outputs = outputs[:, :, 1:, 1:]
+        return outputs

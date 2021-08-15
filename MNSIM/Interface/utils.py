@@ -119,7 +119,7 @@ def transfer_awnas_state_dict(cand_net):
         param.update({
             "last_value": torch.Tensor([last_value])
         })
-        if cfg["_type"] == "conv" or cfg["_type"] == "fc":
+        if cfg["_type"] == "conv" or cfg["_type"] == "fc" or cfg["_type"] == "group_conv":
             assert len(cfg['input']) == 1 and len(cfg['output']) == 1
             assert "weight_info" in cfg.keys()
             bit_scale_list = []
@@ -146,6 +146,9 @@ def transfer_awnas_state_dict(cand_net):
             state_dict[f"layer_list.{i}.bit_scale_list"] = param["bit_scale_list"]
             state_dict[f"layer_list.{i}.layer_list.{i}.weight"] = param["weight"]
         # if self.layer_con
+        if  cfg["_type"] == "group_conv":
+            state_dict[f"layer_list.{i}.bit_scale_list"] = param["bit_scale_list"]
+            state_dict[f"layer_list.{i}.layer_list.{i}.weight"] = param["weight"]
         if mnsim_cfg[i]["_type"] == "bn":
             state_dict[f"layer_list.{i}.layer.weight"] = param["weight"]
             state_dict[f"layer_list.{i}.layer.bias"] = param["bias"]
@@ -251,9 +254,17 @@ def transfer_layer_config_list(mnsim_cfg):
             layer_config_list[-1]["type"] = "element_sum"
         elif cfg["_type"] == "expand":
             layer_config_list[-1]["type"] = "expand"
-            layer_config_list[-1]["max_channels"] =cfg["max_channels"]
+            layer_config_list[-1]["_max_channels"] =cfg["_max_channels"]
         elif cfg["_type"] == "downsample":
             layer_config_list[-1]["type"] = "downsample"
+        elif cfg["_type"] == "group_conv":
+            layer_config_list[-1]["type"] = "group_conv"
+            layer_config_list[-1]["in_channels"] = cfg["in_channels"]
+            layer_config_list[-1]["out_channels"] = cfg["out_channels"]
+            layer_config_list[-1]["kernel_size"] = cfg["kernel_size"]
+            layer_config_list[-1]["stride"] = cfg["stride"]
+            layer_config_list[-1]["padding"] = cfg["padding"]
+            layer_config_list[-1]["groups"] = cfg["groups"]
         elif cfg["_type"] == "quantize":
             raise Exception(
                 "NOT support quantize layer in MNSIM"

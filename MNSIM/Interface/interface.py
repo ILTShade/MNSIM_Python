@@ -179,6 +179,9 @@ class TrainTestInterface(object):
                 if layer_structure_info['type'] in ['element_sum', 'pooling']:
                     net_array.append([(layer_structure_info, None)])
                 continue
+            if 'groups' in layer_structure_info.keys():
+                assert len(layer_bit_weights) == layer_structure_info['groups']
+                layer_bit_weights = layer_bit_weights[0]
             assert len(layer_bit_weights.keys()) == layer_structure_info['row_split_num'] * layer_structure_info['weight_cycle'] * 2
             # split
             for i in range(layer_structure_info['row_split_num']):
