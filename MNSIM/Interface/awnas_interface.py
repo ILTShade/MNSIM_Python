@@ -12,7 +12,7 @@
 """
 # -*-coding:utf-8-*-
 import torch
-from torch import nn
+from torch import is_storage, nn
 from MNSIM.Interface import utils
 from MNSIM.Interface.network import NetworkGraph
 from MNSIM.Interface.interface import TrainTestInterface
@@ -21,7 +21,7 @@ from MNSIM.Latency_Model.Model_latency import Model_latency
 from MNSIM.Area_Model.Model_Area import Model_area
 from MNSIM.Power_Model.Model_inference_power import Model_inference_power
 from MNSIM.Energy_Model.Model_energy import Model_energy
-
+from MNSIM.Accuracy_Model.Weight_update import weight_update
 class AWNASTrainTestInterface(TrainTestInterface):
     """
     awnas interface
@@ -97,7 +97,7 @@ class AWNASTrainTestInterface(TrainTestInterface):
             outputs = self.net(inputs, method, adc_action)
         return outputs
 
-    def hardware_evaluate(self, inputs):
+    def hardware_evaluate(self, inputs , is_SAF = 1, is_Variation = 1, is_Rratio = 1):
         """
         hardware evaluate
         """
@@ -106,7 +106,8 @@ class AWNASTrainTestInterface(TrainTestInterface):
         with torch.no_grad():
             net_weights = self.get_net_bits()
             # add variation to net weights
-            outputs = self.net.set_weights_forward(inputs, net_weights, adc_action)
+            net_weights_2 = weight_update(SimConfig_path=self.SimConfig_path, weight=net_weights, is_SAF=is_SAF, is_Variation=is_Variation, is_Rratio=is_Rratio)
+            outputs = self.net.set_weights_forward(inputs, net_weights_2, adc_action)
         return outputs
 
     def _get_latency_model(self):
